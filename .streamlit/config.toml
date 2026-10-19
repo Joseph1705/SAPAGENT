@@ -1,0 +1,12 @@
+[theme]
+primaryColor = "#2A78D6"
+font = "sans serif"
+
+[server]
+maxUploadSize = 200
+
+[browser]
+gatherUsageStats = false
+
+[client]
+toolbarMode = "minimal"

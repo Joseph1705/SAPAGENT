@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+rapport_*.xlsx
+.env
+.streamlit/secrets.toml
+# Never commit real customer data
+donnees_reelles/
+!exemples/rapport_exemple.xlsx

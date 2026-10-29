@@ -14,26 +14,34 @@ import unicodedata
 COLUMNS: dict[str, tuple[str, list[str]]] = {
     "order_id": ("N° d'ordre", ["aufnr", "order", "ordre", "n ordre", "no ordre", "numero ordre", "work order", "order number"]),
     "order_type": ("Type d'ordre", ["auart", "order type", "type ordre", "type d ordre", "type"]),
-    "notification_id": ("N° d'avis", ["qmnum", "notification", "avis", "n avis", "no avis", "notification number"]),
+    "notification_id": ("N° d'avis", ["qmnum", "notification", "notif", "avis", "n avis", "no avis", "notification number"]),
+    "notification_type": ("Type d'avis", ["qmart", "notification type", "notif type", "notifictn type", "type avis", "type d avis"]),
     "equipment_id": ("Équipement", ["equnr", "equipment", "equipement", "n equipement", "equipment number"]),
     "equipment_desc": ("Désignation équipement", ["eqktx", "equipment description", "description equipement", "designation equipement", "desig equipement", "equipment desc"]),
-    "functional_location": ("Poste technique", ["tplnr", "functional location", "functional loc", "poste technique", "func loc"]),
-    "description": ("Description (texte libre)", ["ktext", "description", "short text", "texte court", "designation", "desc", "texte", "libelle"]),
+    "functional_location": ("Poste technique", ["tplnr", "functional location", "functional loc", "functional loc.", "poste technique", "func loc"]),
+    "description": ("Description (texte libre)", ["ktext", "qmtxt", "description", "short text", "texte court", "designation", "desc", "texte", "libelle"]),
     "priority": ("Priorité", ["priok", "priority", "priorite", "prio"]),
-    "created_date": ("Date de création", ["erdat", "created on", "date de creation", "cree le", "creation date", "basic start date", "gstrp", "date debut au plus tot", "date"]),
-    "malfunction_start": ("Début panne", ["ausvn", "malfunction start", "start of malfunction", "debut panne", "debut de panne", "debut dysfonctionnement"]),
-    "malfunction_end": ("Fin panne", ["ausbs", "malfunction end", "end of malfunction", "fin panne", "fin de panne", "fin dysfonctionnement"]),
-    "breakdown": ("Arrêt machine", ["msaus", "breakdown", "breakdown indicator", "arret", "arret machine", "panne"]),
+    "created_date": ("Date de création", ["erdat", "qmdat", "created on", "date de creation", "cree le", "creation date", "notif date", "notification date", "date avis", "date"]),
+    "basic_start": ("Date de début de base", ["gstrp", "bsc start", "bsc start date", "basic start", "basic start date", "bas start date",
+                                               "debut base", "date de debut de base", "date debut de base", "debut au plus tot",
+                                               "date debut au plus tot", "debut prevu"]),
+    "malfunction_start": ("Début panne", ["ausvn", "malfunction start", "malfunct start", "start of malfunction", "debut panne", "debut de panne", "debut dysfonctionnement"]),
+    "malfunction_end": ("Fin panne", ["ausbs", "malfunction end", "malfunct end", "end of malfunction", "fin panne", "fin de panne", "fin dysfonctionnement"]),
+    "breakdown": ("Arrêt machine", ["msaus", "breakdown", "breakdown indicator", "breakdown ind", "arret", "arret machine", "panne"]),
     "status": ("Statut système", ["sttxt", "system status", "status", "statut", "statut systeme"]),
-    "actual_cost": ("Coûts réels", ["gksti", "actual costs", "total actual costs", "tot act costs", "couts reels", "couts reels totaux", "cout", "cost"]),
-    "work_center": ("Poste de travail", ["vaplz", "arbpl", "main work center", "work center", "poste de travail", "poste de travail principal"]),
+    "actual_cost": ("Coûts réels", ["gksti", "actual costs", "total actual costs", "tot act costs", "total act costs", "couts reels", "couts reels totaux", "cout", "cost"]),
+    "work_center": ("Poste de travail principal", ["vaplz", "arbpl", "main work center", "main work centre", "main workctr", "main work ctr", "mn wk ctr",
+                                                    "mnwkctr", "work center", "work centre", "poste de travail", "poste de travail principal", "poste trav princ"]),
     "damage_code": ("Code dommage", ["fecod", "damage code", "damage", "code dommage", "dommage"]),
     "cause_code": ("Code cause", ["urcod", "cause code", "cause", "code cause"]),
     "actual_hours": ("Heures réelles", ["ismnw", "actual work", "travail reel", "heures reelles", "actual hours"]),
 }
 
-REQUIRED = ["order_id", "equipment_id", "created_date"]
-RECOMMENDED = ["order_type", "description", "malfunction_start", "malfunction_end", "status", "actual_cost"]
+# An export needs an identifier, an equipment and at least one date (checked in the loader).
+KEY_COLUMNS = ["order_id", "notification_id"]
+DATE_COLUMNS = ["created_date", "basic_start", "malfunction_start"]
+RECOMMENDED = ["order_type", "description", "basic_start", "malfunction_start", "malfunction_end", "status",
+               "actual_cost", "work_center"]
 
 # Default SAP PM order-type meaning. Plants customise these; edit to match.
 ORDER_TYPES = {
@@ -42,17 +50,25 @@ ORDER_TYPES = {
     "PM03": "inspection",
     "PM04": "emergency",
 }
+# Standard SAP PM notification types, used when the export has no order type (IW29 / ZGMT_IW29).
+NOTIFICATION_TYPES = {
+    "M1": "request",      # demande de maintenance
+    "M2": "corrective",   # avis de panne / dysfonctionnement
+    "M3": "activity",     # compte rendu d'activité
+}
 ORDER_TYPE_LABELS = {
     "corrective": "Correctif",
     "preventive": "Préventif",
     "inspection": "Inspection",
     "emergency": "Urgence",
+    "request": "Demande",
+    "activity": "Compte rendu",
     "unknown": "Inconnu",
 }
 FAILURE_KINDS = {"corrective", "emergency"}
 PLANNED_KINDS = {"preventive", "inspection"}
 
-CLOSED_STATUSES = ("TECO", "CLSD", "CLOT", "CLOS", "CLOSED", "DLFL")
+CLOSED_STATUSES = ("TECO", "CLSD", "CLOT", "CLOS", "CLOSED", "DLFL", "NOCO", "ACCL")
 
 CATEGORIES: dict[str, str] = {
     "bearing": "Roulements",

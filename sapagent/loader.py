@@ -12,10 +12,12 @@ from .schema import (
     ALIAS_INDEX,
     CLOSED_STATUSES,
     COLUMNS,
+    DATE_COLUMNS,
     FAILURE_KINDS,
+    KEY_COLUMNS,
+    NOTIFICATION_TYPES,
     ORDER_TYPES,
     RECOMMENDED,
-    REQUIRED,
     normalise,
 )
 
@@ -78,9 +80,15 @@ def load_export(source, filename: str | None = None) -> LoadResult:
         raise ExportError("Le fichier est vide.")
 
     mapping, unmapped = map_columns(list(raw.columns))
-    missing = [c for c in REQUIRED if c not in mapping]
+    missing = []
+    if not any(c in mapping for c in KEY_COLUMNS):
+        missing.append(" ou ".join(COLUMNS[c][0] for c in KEY_COLUMNS))
+    if "equipment_id" not in mapping:
+        missing.append(COLUMNS["equipment_id"][0])
+    if not any(c in mapping for c in DATE_COLUMNS):
+        missing.append(" ou ".join(COLUMNS[c][0] for c in DATE_COLUMNS))
     if missing:
-        labels = ", ".join(COLUMNS[c][0] for c in missing)
+        labels = ", ".join(missing)
         raise ExportError(
             f"Colonnes obligatoires introuvables : {labels}. "
             f"Colonnes lues dans le fichier : {', '.join(map(str, raw.columns))}."
@@ -91,19 +99,28 @@ def load_export(source, filename: str | None = None) -> LoadResult:
         if col not in df:
             df[col] = pd.NA
 
-    text_cols = ["order_id", "order_type", "notification_id", "equipment_id", "equipment_desc",
+    text_cols = ["order_id", "order_type", "notification_id", "notification_type", "equipment_id", "equipment_desc",
                  "functional_location", "description", "status", "work_center", "damage_code",
                  "cause_code", "breakdown", "priority"]
     for col in text_cols:
         df[col] = df[col].astype("string").str.strip().replace("", pd.NA)
 
-    for col in ["created_date", "malfunction_start", "malfunction_end"]:
+    for col in ["created_date", "basic_start", "malfunction_start", "malfunction_end"]:
         df[col] = _parse_dates(df[col].astype("string"))
+    # Notification lists (IW29) have no order number: the notification is the record.
+    df["order_id"] = df["order_id"].fillna(df["notification_id"])
+    df = df[df["order_id"].notna()]
+    # Creation date falls back to the basic start date, then to the malfunction start.
+    df["created_date"] = df["created_date"].fillna(df["basic_start"]).fillna(df["malfunction_start"])
     for col in ["actual_cost", "actual_hours"]:
         df[col] = _parse_numbers(df[col])
 
     df["equipment_desc"] = df["equipment_desc"].fillna(df["equipment_id"])
-    df["order_kind"] = df["order_type"].str.upper().map(ORDER_TYPES).fillna("unknown")
+    df["order_kind"] = (
+        df["order_type"].str.upper().map(ORDER_TYPES)
+        .fillna(df["notification_type"].str.upper().map(NOTIFICATION_TYPES))
+        .fillna("unknown")
+    )
     if df["order_kind"].eq("unknown").all():
         # No usable order type: treat every order as a corrective intervention.
         df["order_kind"] = "corrective"
@@ -114,14 +131,17 @@ def load_export(source, filename: str | None = None) -> LoadResult:
     duration = (df["malfunction_end"] - df["malfunction_start"]).dt.total_seconds() / 3600
     has_breakdown_flag = df["breakdown"].notna().any()
     stopped = df["breakdown"].fillna("").str.upper().isin(["X", "1", "OUI", "YES", "TRUE"]) if has_breakdown_flag else df["is_failure"]
+    df["is_stop"] = stopped.astype(bool)
     df["downtime_h"] = duration.where(stopped & (duration >= 0)).fillna(0.0).round(2)
     df["duration_invalid"] = duration < 0
 
     warnings = []
     if not has_breakdown_flag and "malfunction_start" in mapping:
         warnings.append("Pas de colonne « Arrêt machine » : toutes les pannes avec dates sont comptées comme arrêts.")
-    if "order_type" not in mapping:
-        warnings.append("Pas de colonne « Type d'ordre » : tous les ordres sont traités comme correctifs.")
+    if "order_type" not in mapping and "notification_type" not in mapping:
+        warnings.append("Pas de colonne « Type d'ordre » ni « Type d'avis » : tous les ordres sont traités comme correctifs.")
+    if "order_id" not in mapping:
+        warnings.append("Export d'avis (pas de n° d'ordre) : chaque avis est analysé comme une intervention.")
 
     return LoadResult(
         data=df.reset_index(drop=True),

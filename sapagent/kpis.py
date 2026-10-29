@@ -23,6 +23,7 @@ class Analysis:
     monthly: pd.DataFrame
     backlog: pd.DataFrame
     backlog_buckets: pd.DataFrame
+    workcenters: pd.DataFrame
     quality: dict
 
 
@@ -133,15 +134,78 @@ def monthly_trend(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def backlog_view(df: pd.DataFrame, ref_date: pd.Timestamp) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Open orders with their age and lateness. An order is late when its basic start date (IW39 « Bsc start ») is past."""
     open_ = df[df["is_open"]].copy()
     open_["age_days"] = (ref_date - open_["created_date"]).dt.days
+    last_day = ref_date - pd.Timedelta(days=1)
+    open_["days_late"] = (last_day - open_["basic_start"].dt.normalize()).dt.days
+    open_["is_overdue"] = open_["days_late"] > 0
     bins = [-1, 7, 30, 90, 10_000]
     labels = ["0–7 j", "8–30 j", "31–90 j", "> 90 j"]
     open_["age_bucket"] = pd.cut(open_["age_days"], bins=bins, labels=labels)
     buckets = open_.groupby("age_bucket", observed=False).size().reindex(labels, fill_value=0).reset_index(name="orders")
-    cols = ["order_id", "order_type", "equipment_id", "equipment_desc", "description", "priority", "status",
-            "created_date", "age_days", "age_bucket"]
-    return open_.sort_values("age_days", ascending=False)[cols].reset_index(drop=True), buckets
+    cols = ["order_id", "order_type", "work_center", "equipment_id", "equipment_desc", "description", "priority",
+            "status", "created_date", "basic_start", "days_late", "is_overdue", "age_days", "age_bucket"]
+    open_ = open_.sort_values(["is_overdue", "days_late", "age_days"], ascending=False)
+    return open_[cols].reset_index(drop=True), buckets
+
+
+def workcenter_view(backlog: pd.DataFrame) -> pd.DataFrame:
+    """Open and late orders per main work centre — what IW39 is used for, in one table."""
+    if backlog.empty:
+        return pd.DataFrame(columns=["work_center", "open_orders", "overdue", "high_priority_open", "max_days_late", "oldest_days"])
+    b = backlog.assign(work_center=backlog["work_center"].fillna("—"),
+                       high=backlog["priority"].astype(str).isin(["1", "2"]))
+    wc = b.groupby("work_center").agg(
+        open_orders=("order_id", "size"),
+        overdue=("is_overdue", "sum"),
+        high_priority_open=("high", "sum"),
+        max_days_late=("days_late", "max"),
+        oldest_days=("age_days", "max"),
+    )
+    wc["max_days_late"] = wc["max_days_late"].clip(lower=0)
+    return wc.sort_values(["overdue", "open_orders"], ascending=False).reset_index()
+
+
+def latest_day(df: pd.DataFrame) -> pd.Timestamp:
+    return df["created_date"].dropna().max().normalize()
+
+
+def daily_brief(a: Analysis, day: pd.Timestamp | None = None, max_stop_days: int = 7) -> dict:
+    """What happened on one day — the view used in the morning operations meeting (« J-1 », cf. ZGMT_IW29)."""
+    df = a.orders
+    day = pd.Timestamp(day).normalize() if day is not None else latest_day(df)
+    day_end = day + pd.Timedelta(days=1)
+
+    event_time = df["malfunction_start"].fillna(df["created_date"])
+    on_day = df[(event_time >= day) & (event_time < day_end)].copy()
+    failures = on_day[on_day["is_failure"]]
+    stops = failures[failures["is_stop"]]
+
+    # Machines still stopped at the end of the day: stop started, no end yet (or ending later).
+    # Older open stops are almost always a missing end date, reported as a data-quality issue instead.
+    started = (df["is_failure"] & df["is_stop"] & (df["malfunction_start"] < day_end)
+               & (df["malfunction_start"] >= day_end - pd.Timedelta(days=max_stop_days)))
+    still_down = df[started & (df["malfunction_end"].isna() | (df["malfunction_end"] >= day_end))].copy()
+    still_down["down_since_h"] = ((day_end - still_down["malfunction_start"]).dt.total_seconds() / 3600).round(1)
+
+    recurring = set(zip(a.repeats["equipment_id"], a.repeats["category"])) if not a.repeats.empty else set()
+    on_day["recurring"] = [(e, c) in recurring for e, c in zip(on_day["equipment_id"], on_day["category"])]
+    on_day["prio_sort"] = pd.to_numeric(on_day["priority"], errors="coerce").fillna(9)
+    on_day = on_day.sort_values(["is_failure", "prio_sort", "downtime_h"], ascending=[False, True, False])
+
+    return {
+        "day": day,
+        "interventions": on_day.drop(columns="prio_sort").reset_index(drop=True),
+        "n_interventions": len(on_day),
+        "n_failures": len(failures),
+        "n_stops": len(stops),
+        "n_emergencies": int((on_day["order_kind"] == "emergency").sum()),
+        "downtime_h": float(stops["downtime_h"].sum()),
+        "n_recurring": int(on_day["recurring"].sum()),
+        "still_down": still_down.sort_values("malfunction_start").reset_index(drop=True),
+        "planned": int(on_day["order_kind"].isin(PLANNED_KINDS).sum()),
+    }
 
 
 def data_quality(df: pd.DataFrame, missing_recommended: list[str]) -> dict:
@@ -180,6 +244,7 @@ def analyse(df: pd.DataFrame, missing_recommended: list[str] | None = None,
     repeats = repeat_failures(df, window_days, min_occurrences)
     monthly = monthly_trend(df)
     backlog, buckets = backlog_view(df, end)
+    workcenters = workcenter_view(backlog)
 
     failures = df[df["is_failure"]]
     stops = failures[failures["downtime_h"] > 0]
@@ -198,6 +263,7 @@ def analyse(df: pd.DataFrame, missing_recommended: list[str] | None = None,
         "emergency_ratio": float((df["order_kind"] == "emergency").mean()),
         "open_orders": int(df["is_open"].sum()),
         "backlog_over_30d": int((backlog["age_days"] > 30).sum()),
+        "overdue_orders": int(backlog["is_overdue"].sum()),
         "repeat_patterns": len(repeats),
     }
     return Analysis(
@@ -212,5 +278,6 @@ def analyse(df: pd.DataFrame, missing_recommended: list[str] | None = None,
         monthly=monthly,
         backlog=backlog,
         backlog_buckets=buckets,
+        workcenters=workcenters,
         quality=quality,
     )

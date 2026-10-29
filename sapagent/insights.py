@@ -36,6 +36,7 @@ def summary_payload(a: Analysis, top_n: int = 10) -> dict:
         "failure_modes": cat.round(3).to_dict("records"),
         "repeat_failures": a.repeats[rep_cols].head(top_n).to_dict("records"),
         "backlog_age_buckets": a.backlog_buckets.astype({"age_bucket": str}).to_dict("records"),
+        "open_and_overdue_by_work_center": a.workcenters.head(top_n).to_dict("records"),
         "data_quality": a.quality,
     }
 
@@ -65,7 +66,14 @@ def rule_based_insights(a: Analysis) -> dict:
         f"Travail planifié (préventif + inspection) : {ov['planned_ratio']:.0%} des ordres "
         f"(référence courante : {PLANNED_TARGET:.0%})."
     )
-    if ov["backlog_over_30d"]:
+    wc = a.workcenters
+    if ov.get("overdue_orders"):
+        worst = wc.iloc[0]
+        findings.append(
+            f"{ov['overdue_orders']} ordres ouverts sur {ov['open_orders']} sont en retard (date de début de base dépassée), "
+            f"dont {int(worst.overdue)} au poste de travail {worst.work_center}."
+        )
+    elif ov["backlog_over_30d"]:
         findings.append(f"{ov['backlog_over_30d']} ordres ouverts depuis plus de 30 jours.")
 
     for r in top3.itertuples():
@@ -94,7 +102,16 @@ def rule_based_insights(a: Analysis) -> dict:
             "action": "Augmenter la part de maintenance planifiée, en priorité sur les équipements critiques ci-dessus.",
             "rationale": f"{ov['planned_ratio']:.0%} de travail planifié contre une référence de {PLANNED_TARGET:.0%}.",
         })
-    if ov["backlog_over_30d"]:
+    if ov.get("overdue_orders"):
+        top_wc = ", ".join(f"{r.work_center} ({int(r.overdue)})" for r in wc[wc["overdue"] > 0].head(3).itertuples())
+        recs.append({
+            "priority": "Moyenne",
+            "equipment": "Planification — postes " + ", ".join(wc[wc["overdue"] > 0].head(3)["work_center"]),
+            "action": "Revue hebdomadaire des ordres en retard par poste de travail : réaliser, replanifier ou clôturer (TECO).",
+            "rationale": f"{ov['overdue_orders']} ordres en retard, surtout : {top_wc}. "
+                         f"{ov['backlog_over_30d']} ordres sont ouverts depuis plus de 30 jours.",
+        })
+    elif ov["backlog_over_30d"]:
         recs.append({
             "priority": "Moyenne",
             "equipment": "Planification",

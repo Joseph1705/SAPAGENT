@@ -9,11 +9,13 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-from sapagent import ai
+from sapagent import __version__, ai
 from sapagent.insights import fmt_h, fmt_usd
+from sapagent.kpis import daily_brief, latest_day
 from sapagent.pipeline import run
-from sapagent.report import build_report
+from sapagent.report import build_daily_brief, build_report
 from sapagent.sample_data import generate
+from sapagent.sap_reference import EXPORT_TRANSACTIONS, IW39_STEPS, USEFUL_COLUMNS
 from sapagent.schema import CATEGORIES, COLUMNS, ORDER_TYPE_LABELS
 
 BLUE, ORANGE, GREY = "#2A78D6", "#EB6834", "#9CA3AF"
@@ -39,16 +41,25 @@ st.markdown(
 
 
 # ---------------------------------------------------------------- data
+# Cache keys: the leading arguments. Underscored arguments (API key, result objects) are not hashed.
 @st.cache_data(show_spinner=False)
-def analyse_cached(data: bytes, filename: str, use_ai: bool, key_hash: str, window: int, min_occ: int,
-                   _api_key: str | None):
-    return run(data, filename, use_ai=use_ai, api_key=_api_key, window_days=window, min_occurrences=min_occ)
+def analyse_cached(data: bytes, filename: str, ai_sig: str, window: int, min_occ: int, work_centers: str,
+                   _cfg: ai.AIConfig | None):
+    return run(data, filename, ai_config=_cfg, window_days=window, min_occurrences=min_occ, work_centers=work_centers)
 
 
 @st.cache_data(show_spinner=False)
-def report_cached(data: bytes, filename: str, use_ai: bool, key_hash: str, window: int, min_occ: int,
+def report_cached(data: bytes, filename: str, ai_sig: str, window: int, min_occ: int, work_centers: str,
                   _result) -> bytes:
     return build_report(_result.analysis, _result.insights, filename)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def openrouter_models() -> list[str]:
+    try:
+        return [m["id"] for m in ai.list_openrouter_models()]
+    except Exception:
+        return []
 
 
 @st.cache_data
@@ -81,7 +92,7 @@ def bar(df, x, y, color=BLUE, height=380, orientation="h", **kw):
 # ---------------------------------------------------------------- sidebar
 with st.sidebar:
     st.markdown("## 🛠️ SAP PM Analyst")
-    st.caption("Analyse des exports de maintenance SAP PM en quelques secondes.")
+    st.caption(f"Analyse des exports de maintenance SAP PM en quelques secondes · v{__version__}")
 
     st.markdown("#### 1 · Données")
     upload = st.file_uploader("Export SAP PM (Excel ou CSV)", type=["xlsx", "xls", "csv"],
@@ -91,29 +102,41 @@ with st.sidebar:
     if upload is not None:
         st.session_state["demo"] = False
 
-    st.markdown("#### 2 · Intelligence artificielle")
-    api_key = st.text_input("Clé API Anthropic (optionnel)", type="password",
-                            help="Sans clé, l'outil fonctionne avec son analyse automatique par règles.") or None
-    can_ai = ai.has_credentials(api_key)
-    use_ai = st.toggle("Analyse rédigée par Claude", value=False, disabled=not can_ai,
+    st.markdown("#### 2 · Intelligence artificielle (optionnel)")
+    provider = st.radio("Fournisseur", list(ai.PROVIDERS), format_func=ai.PROVIDERS.get, horizontal=True,
+                        help="Anthropic : Claude en direct. OpenRouter : une seule clé pour Claude, GPT, Gemini, Mistral, Llama…")
+    cfg = ai.AIConfig(provider=provider)
+    cfg.api_key = st.text_input(f"Clé API {ai.PROVIDERS[provider].split()[0]}", type="password",
+                                help="Sans clé, l'outil fonctionne avec son analyse automatique par règles.") or None
+    if provider == "openrouter":
+        ids = openrouter_models()
+        if ids:
+            default = ai.pick_default_model(ids)
+            cfg.model = st.selectbox("Modèle", ids, index=ids.index(default) if default in ids else 0,
+                                     help="Modèles OpenRouter compatibles avec les sorties JSON structurées, du plus récent au plus ancien.")
+        else:
+            cfg.model = st.text_input("Modèle OpenRouter", placeholder="fournisseur/modèle, ex. anthropic/claude-sonnet-4.5",
+                                      help="Liste des modèles indisponible : saisissez l'identifiant OpenRouter (openrouter.ai/models).") or None
+    can_ai = ai.has_credentials(cfg) and (provider == "anthropic" or bool(cfg.model))
+    use_ai = st.toggle("Analyse rédigée par l'IA", value=False, disabled=not can_ai,
                        help="Classe les descriptions ambiguës et rédige résumé + recommandations. "
                             "Les chiffres restent calculés par le code, jamais par l'IA.")
     if not can_ai:
-        st.caption("Ajoutez une clé pour activer l'IA.")
+        st.caption("Ajoutez une clé" + (" et un modèle" if provider == "openrouter" else "") + " pour activer l'IA.")
 
     with st.expander("Paramètres d'analyse"):
         window = st.slider("Fenêtre de récidive (jours)", 7, 90, 30)
         min_occ = st.slider("Occurrences minimum pour une panne récurrente", 2, 10, 3)
+        work_centers = st.text_input("Postes de travail principaux", placeholder="ex. MECA*, ELEC-01",
+                                     help="Comme dans IW39 : le joker * sélectionne tous les postes qui commencent "
+                                          "par ce code. Plusieurs codes séparés par des virgules. Vide = tous.").strip()
 
     with st.expander("Comment exporter depuis SAP ?"):
-        st.markdown(
-            "1. Transaction **IW39** (ordres) ou **IW29** (avis)\n"
-            "2. Sélectionnez la période et le site\n"
-            "3. Ajoutez si possible les colonnes : équipement, type d'ordre, description, "
-            "début / fin de panne, arrêt machine, statut, coûts réels, code dommage\n"
-            "4. Menu **Liste → Exporter → Tableur** (ou icône Excel)\n\n"
-            "Les noms de colonnes français, anglais ou techniques (AUFNR, EQUNR…) sont reconnus."
-        )
+        st.markdown("**Export IW39 pas à pas**\n\n" + "\n".join(f"{i}. {t}" for i, t in enumerate(IW39_STEPS, 1)))
+        st.caption(f"Colonnes utiles : {USEFUL_COLUMNS}")
+        st.markdown("**Transactions utiles**")
+        st.dataframe(pd.DataFrame([(c, d, "✅" if ok else "bientôt") for c, d, _, ok in EXPORT_TRANSACTIONS],
+                                  columns=["Code", "Transaction", "Lu par l'outil"]), hide_index=True)
 
 # ---------------------------------------------------------------- source
 if upload is not None:
@@ -133,8 +156,8 @@ if data is None:
     st.write("")
     c1, c2, c3 = st.columns(3)
     for col, title, text in [
-        (c1, "1 · Déposer l'export", "Fichier Excel ou CSV d'IW39 / IW29. Les colonnes sont reconnues automatiquement."),
-        (c2, "2 · Lire l'analyse", "MTBF, MTTR, disponibilité, Pareto des pannes, pannes récurrentes, backlog, qualité des données."),
+        (c1, "1 · Déposer l'export", "Fichier Excel ou CSV d'IW39, IW29 ou ZGMT_IW29. Les colonnes sont reconnues automatiquement."),
+        (c2, "2 · Lire l'analyse", "MTBF, MTTR, Pareto des pannes, pannes récurrentes, ordres en retard par poste de travail, réunion J-1."),
         (c3, "3 · Partager le rapport", "Un classeur Excel professionnel, avec des formules traçables jusqu'à chaque ordre."),
     ]:
         col.markdown(f'<div class="step"><b>{title}</b><br><span class="muted">{text}</span></div>', unsafe_allow_html=True)
@@ -145,10 +168,11 @@ if data is None:
     st.caption("Les données de démonstration sont entièrement fictives (usine de traitement de minerai, 12 mois, 23 équipements).")
     st.stop()
 
-key_hash = hashlib.sha256((api_key or "").encode()).hexdigest()[:12]
-with st.spinner("Analyse en cours…" + (" (Claude rédige l'analyse, ~1 min)" if use_ai else "")):
+key_hash = hashlib.sha256((cfg.api_key or "").encode()).hexdigest()[:12]
+ai_sig = f"{cfg.provider}|{cfg.model}|{key_hash}" if use_ai else ""
+with st.spinner("Analyse en cours…" + (f" ({cfg.label} rédige l'analyse, ~1 min)" if use_ai else "")):
     try:
-        result = analyse_cached(data, filename, use_ai, key_hash, window, min_occ, api_key)
+        result = analyse_cached(data, filename, ai_sig, window, min_occ, work_centers, cfg if use_ai else None)
     except ValueError as exc:
         st.error(f"Impossible d'analyser ce fichier. {exc}")
         st.stop()
@@ -161,11 +185,12 @@ h1, h2 = st.columns([3, 1])
 with h1:
     st.markdown("## Analyse maintenance")
     st.caption(f"**{filename}** · Période du {a.period_start:%d/%m/%Y} au {a.period_end - pd.Timedelta(days=1):%d/%m/%Y} · "
-               f"{ov['orders']} ordres · {ov['equipment']} équipements")
+               f"{ov['orders']} ordres · {ov['equipment']} équipements"
+               + (f" · postes de travail : {work_centers}" if work_centers else ""))
 with h2:
     st.write("")
     st.download_button("⬇  Télécharger le rapport Excel",
-                       report_cached(data, filename, use_ai, key_hash, window, min_occ, result),
+                       report_cached(data, filename, ai_sig, window, min_occ, work_centers, result),
                        file_name=f"rapport_{Path(filename).stem}.xlsx", type="primary", width="stretch",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
@@ -183,14 +208,16 @@ m[4].metric("Travail planifié", f"{ov['planned_ratio']:.0%}", border=True,
             delta=f"{ov['planned_ratio'] - 0.8:+.0%} vs 80 %", delta_color="normal")
 m[5].metric("Coût total", compact_usd(ov["cost"]), border=True, help=fmt_usd(ov["cost"]))
 
-tabs = st.tabs(["Synthèse", "Équipements", "Modes de défaillance", "Pannes récurrentes", "Tendances",
-                "Backlog", "Qualité des données", "Explorer les ordres"])
+(t_sum, t_j1, t_eq, t_cat, t_rep, t_trend, t_bl, t_q, t_x) = st.tabs(
+    ["Synthèse", "Réunion J-1", "Équipements", "Modes de défaillance", "Pannes récurrentes", "Tendances",
+     "Backlog & retards", "Qualité des données", "Explorer les ordres"])
 
 # ---------------------------------------------------------------- Synthèse
-with tabs[0]:
+with t_sum:
     left, right = st.columns([1.15, 1])
     with left:
-        badge = ":violet-badge[Analyse IA · Claude]" if ins.get("source") == "claude" else ":gray-badge[Analyse automatique · règles]"
+        badge = (f":violet-badge[Analyse IA · {ins.get('model', 'IA')}]" if ins.get("source") == "ai"
+                 else ":gray-badge[Analyse automatique · règles]")
         st.markdown(f"#### Résumé  {badge}")
         st.write(ins["executive_summary"])
         st.markdown("#### Constats clés")
@@ -214,8 +241,55 @@ with tabs[0]:
             st.caption(f"📊 {rec['rationale']}")
     st.caption("Aide à la décision : chaque recommandation doit être validée par l'ingénieur maintenance.")
 
+# ---------------------------------------------------------------- Réunion J-1
+with t_j1:
+    last = latest_day(orders)
+    c1, c2 = st.columns([1, 2])
+    day = c1.date_input("Journée à passer en revue", value=last.date(), min_value=a.period_start.date(),
+                        max_value=last.date(), format="DD/MM/YYYY",
+                        help="Par défaut, le dernier jour de l'export : la veille de la réunion opérationnelle (cf. ZGMT_IW29).")
+    brief = daily_brief(a, pd.Timestamp(day))
+    with c2:
+        st.write("")
+        st.download_button("⬇  Fiche réunion J-1 (Excel)", build_daily_brief(brief, filename),
+                           file_name=f"reunion_J-1_{pd.Timestamp(day):%Y-%m-%d}.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    k = st.columns(6)
+    k[0].metric("Interventions", brief["n_interventions"], border=True)
+    k[1].metric("Pannes", brief["n_failures"], border=True)
+    k[2].metric("Arrêts machine", brief["n_stops"], border=True)
+    k[3].metric("Heures d'arrêt", f"{brief['downtime_h']:.1f} h", border=True, help="Arrêts terminés commencés ce jour-là")
+    k[4].metric("Urgences", brief["n_emergencies"], border=True)
+    k[5].metric("Récidives connues", brief["n_recurring"], border=True,
+                help="Panne sur un équipement et un mode déjà identifiés comme récurrents")
+
+    still = brief["still_down"]
+    if still.empty:
+        st.success("Aucun équipement à l'arrêt en fin de journée.")
+    else:
+        st.error(f"**{len(still)} équipement(s) toujours à l'arrêt en fin de journée** : "
+                 + " · ".join(f"{r.equipment_desc} ({r.down_since_h:.0f} h)" for r in still.itertuples()))
+    items = brief["interventions"].assign(
+        nature=lambda d: d["order_kind"].map(ORDER_TYPE_LABELS),
+        mode=lambda d: d["category"].map(CATEGORIES).fillna(""),
+        start=lambda d: d["malfunction_start"].dt.strftime("%H:%M").fillna(""),
+        arret=lambda d: [("en cours" if still else f"{h:.1f} h") if stop else ""
+                         for h, stop, still in zip(d["downtime_h"], d["is_stop"], d["order_id"].isin(still["order_id"]))],
+        recidive=lambda d: d["recurring"].map({True: "⚠️", False: ""}))
+    if items.empty:
+        st.info("Aucune intervention enregistrée ce jour-là.")
+    else:
+        st.dataframe(items[["order_id", "recidive", "nature", "equipment_desc", "description", "mode", "priority",
+                            "start", "arret"]],
+                     hide_index=True, width="stretch",
+                     column_config={"order_id": "Ordre", "recidive": st.column_config.TextColumn("", width=40, help="Panne récurrente connue"), "nature": "Nature", "equipment_desc": "Équipement",
+                                    "description": "Description", "mode": "Mode de défaillance", "priority": "Prio",
+                                    "start": "Début panne", "arret": "Arrêt"})
+    st.caption("⚠️ = panne récurrente connue (même équipement, même mode). "
+               "Astuce : déposez directement l'export de la transaction ZGMT_IW29 pour préparer la réunion du matin.")
+
 # ---------------------------------------------------------------- Équipements
-with tabs[1]:
+with t_eq:
     eq = a.equipment
     c1, c2 = st.columns(2)
     c1.plotly_chart(bar(eq.head(10), "downtime_h", "equipment_desc", title="Top 10 — heures d'arrêt",
@@ -241,7 +315,7 @@ with tabs[1]:
     )
 
 # ---------------------------------------------------------------- Modes de défaillance
-with tabs[2]:
+with t_cat:
     cat = a.categories
     c1, c2 = st.columns([1.2, 1])
     c1.plotly_chart(bar(cat, "failures", "label", title="Pannes par mode de défaillance", height=440,
@@ -265,7 +339,7 @@ with tabs[2]:
                                     "category": "Mode attribué", "category_source": "Source"})
 
 # ---------------------------------------------------------------- Pannes récurrentes
-with tabs[3]:
+with t_rep:
     rep = a.repeats
     if rep.empty:
         st.success("Aucune panne récurrente détectée avec ces paramètres.")
@@ -292,7 +366,7 @@ with tabs[3]:
         st.plotly_chart(fig, width="stretch")
 
 # ---------------------------------------------------------------- Tendances
-with tabs[4]:
+with t_trend:
     mo = a.monthly
     c1, c2 = st.columns(2)
     c1.plotly_chart(bar(mo, "month", "failures", orientation="v", height=340, title="Pannes par mois",
@@ -307,22 +381,39 @@ with tabs[4]:
     st.plotly_chart(fig, width="stretch")
 
 # ---------------------------------------------------------------- Backlog
-with tabs[5]:
-    c1, c2 = st.columns([1, 2])
+with t_bl:
+    k = st.columns(3)
+    k[0].metric("Ordres ouverts", ov["open_orders"], border=True)
+    k[1].metric("En retard", ov["overdue_orders"], border=True,
+                help="Ordres ouverts dont la date de début de base (IW39 « Bsc start ») est dépassée")
+    k[2].metric("Ouverts depuis plus de 30 jours", ov["backlog_over_30d"], border=True)
+    c1, c2 = st.columns([1.3, 1])
     with c1:
-        st.metric("Ordres ouverts", ov["open_orders"], border=True)
-        st.metric("Ouverts depuis plus de 30 jours", ov["backlog_over_30d"], border=True)
+        st.markdown("##### Par poste de travail principal")
+        st.dataframe(a.workcenters, hide_index=True, width="stretch",
+                     column_config={"work_center": "Poste de travail", "open_orders": "Ouverts",
+                                    "overdue": st.column_config.ProgressColumn(
+                                        "En retard", format="%d", min_value=0,
+                                        max_value=int(a.workcenters["open_orders"].max() or 1) if len(a.workcenters) else 1),
+                                    "high_priority_open": "Prio 1-2", "max_days_late": "Retard max (j)",
+                                    "oldest_days": None})
+    with c2:
+        st.markdown("##### Ancienneté des ordres ouverts")
         st.plotly_chart(bar(a.backlog_buckets, "age_bucket", "orders", orientation="v", height=260,
                             labels={"age_bucket": "", "orders": "Ordres"}), width="stretch")
-    with c2:
-        st.dataframe(a.backlog, hide_index=True, width="stretch", height=520,
-                     column_config={"order_id": "Ordre", "order_type": "Type", "equipment_id": "Équipement",
-                                    "equipment_desc": "Désignation", "description": "Description", "priority": "Prio",
-                                    "status": "Statut", "created_date": st.column_config.DateColumn("Créé le", format="DD/MM/YYYY"),
-                                    "age_days": "Âge (j)", "age_bucket": None})
+    only_late = st.toggle("Afficher uniquement les ordres en retard", value=True)
+    bl = a.backlog[a.backlog["is_overdue"]] if only_late else a.backlog
+    st.dataframe(bl.assign(days_late=bl["days_late"].clip(lower=0)), hide_index=True, width="stretch", height=480,
+                 column_config={"order_id": "Ordre", "order_type": "Type", "work_center": "Poste de travail",
+                                "equipment_id": "Équipement", "equipment_desc": "Désignation", "description": "Description",
+                                "priority": "Prio", "status": "Statut",
+                                "created_date": st.column_config.DateColumn("Créé le", format="DD/MM/YYYY"),
+                                "basic_start": st.column_config.DateColumn("Début de base", format="DD/MM/YYYY"),
+                                "days_late": st.column_config.NumberColumn("Retard (j)", format="%d"),
+                                "is_overdue": None, "age_days": "Âge (j)", "age_bucket": None})
 
 # ---------------------------------------------------------------- Qualité
-with tabs[6]:
+with t_q:
     q = a.quality
     c1, c2 = st.columns([1, 2])
     with c1:
@@ -350,7 +441,7 @@ with tabs[6]:
         st.caption("Colonnes ignorées : " + ", ".join(map(str, load.unmapped)))
 
 # ---------------------------------------------------------------- Explorer
-with tabs[7]:
+with t_x:
     c1, c2, c3 = st.columns([2, 1, 1])
     query = c1.text_input("Rechercher (équipement, description, n° d'ordre)", placeholder="ex. garniture, P-201, 4000123")
     kinds = c2.multiselect("Nature", sorted(orders["order_kind"].unique()), format_func=ORDER_TYPE_LABELS.get)

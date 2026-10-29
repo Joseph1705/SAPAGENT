@@ -17,6 +17,7 @@ BLUE = "#2A78D6"
 LIGHT = "#EEF3F9"
 GREY = "#6B7280"
 FONT = "Arial"
+JOURS = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
 
 DATA_COLUMNS = [
     # (header, source column or callable, width, kind)
@@ -261,24 +262,38 @@ def build_report(a: Analysis, insights: dict, source_name: str = "export SAP PM"
     # ------------------------------------------------------------------ Backlog
     bl = a.backlog
     ws_bl.write(0, 0, "Ordres ouverts (backlog)", f["title"])
-    ws_bl.write(1, 0, f"Âge calculé au {a.period_end.date():%d/%m/%Y} (fin de la période).", f["subtitle"])
+    ws_bl.write(1, 0, f"Situation au {a.period_end - pd.Timedelta(days=1):%d/%m/%Y} (dernier jour de l'export). "
+                      "En retard = date de début de base (IW39 « Bsc start ») dépassée.", f["subtitle"])
     ws_bl.write(3, 0, "Ancienneté", f["header"])
     ws_bl.write(3, 1, "Ordres", f["header"])
     for i, row in enumerate(a.backlog_buckets.itertuples(), start=4):
         ws_bl.write_string(i, 0, str(row.age_bucket), f["text"])
         ws_bl.write_number(i, 1, row.orders, f["int"])
-    start = 6 + len(a.backlog_buckets)
-    bh = ["Ordre", "Type", "Équipement", "Désignation", "Description", "Priorité", "Statut", "Créé le", "Âge (j)"]
-    bcols = ["order_id", "order_type", "equipment_id", "equipment_desc", "description", "priority", "status", "created_date", "age_days"]
-    bk = ["text", "text", "text", "text", "text", "text", "text", "date", "int"]
-    for c, (h, w) in enumerate(zip(bh, [12, 8, 12, 30, 38, 8, 10, 12, 8])):
+    wch = ["Poste de travail principal", "Ouverts", "En retard", "Priorité 1-2", "Retard max (j)"]
+    for c, h in enumerate(wch, start=3):
+        ws_bl.write(3, c, h, f["header"])
+    for i, row in enumerate(a.workcenters.itertuples(), start=4):
+        ws_bl.write_string(i, 3, str(row.work_center), f["text"])
+        for c, v in enumerate([row.open_orders, row.overdue, row.high_priority_open, row.max_days_late], start=4):
+            ws_bl.write_number(i, c, 0 if pd.isna(v) else float(v), f["int"])
+    if len(a.workcenters):
+        ws_bl.conditional_format(4, 5, 3 + len(a.workcenters), 5, {"type": "data_bar", "bar_color": "#F4A259", "bar_solid": True})
+    start = 6 + max(len(a.backlog_buckets), len(a.workcenters))
+    bh = ["Ordre", "Type", "Poste de travail", "Équipement", "Désignation", "Description", "Priorité", "Statut",
+          "Créé le", "Début de base", "Retard (j)", "Âge (j)"]
+    bcols = ["order_id", "order_type", "work_center", "equipment_id", "equipment_desc", "description", "priority",
+             "status", "created_date", "basic_start", "days_late", "age_days"]
+    bk = ["text", "text", "text", "text", "text", "text", "text", "text", "date", "date", "int", "int"]
+    for c, (h, w) in enumerate(zip(bh, [12, 8, 14, 12, 30, 38, 8, 10, 12, 12, 9, 8])):
         ws_bl.write(start, c, h, f["header"])
         ws_bl.set_column(c, c, w)
-    _write_rows(ws_bl, bl, bcols, bk, f, start_row=start + 1)
+    ws_bl.set_row(start, 30)
+    _write_rows(ws_bl, bl.assign(days_late=bl["days_late"].clip(lower=0)), bcols, bk, f, start_row=start + 1)
     if len(bl):
-        ws_bl.conditional_format(start + 1, 8, start + len(bl), 8, {"type": "cell", "criteria": ">", "value": 30,
-                                                                    "format": F(font_color="#9B1C1C", bold=True)})
+        ws_bl.conditional_format(start + 1, 10, start + len(bl), 10, {"type": "cell", "criteria": ">", "value": 0,
+                                                                     "format": F(font_color="#9B1C1C", bold=True, bg_color="#FDE2E1")})
         ws_bl.autofilter(start, 0, start + len(bl), len(bh) - 1)
+        ws_bl.freeze_panes(start + 1, 0)
 
     # ------------------------------------------------------------------ Qualité données
     q = a.quality
@@ -319,8 +334,9 @@ def build_report(a: Analysis, insights: dict, source_name: str = "export SAP PM"
         ("Disponibilité", "(Durée de la période − heures d'arrêt) / durée de la période."),
         ("Part planifiée", "Ordres préventifs + inspections / total des ordres. Référence courante : ~80 %."),
         ("Criticité", "Moyenne des parts de l'équipement dans le total des arrêts, des pannes et des coûts ; 100 = équipement le plus pénalisant."),
+        ("Ordre en retard", "Ordre ouvert dont la date de début de base (IW39 « Bsc start date ») est dépassée au dernier jour de l'export."),
         ("Panne récurrente", "Même équipement et même mode de défaillance, au moins 3 occurrences, dont au moins 2 récidives à moins de 30 jours."),
-        ("Classification", "1) code dommage SAP s'il est reconnu ; 2) règles mots-clés FR/EN sur le texte libre ; 3) IA (Claude) pour les textes restants, si activée."),
+        ("Classification", "1) code dommage SAP s'il est reconnu ; 2) règles mots-clés FR/EN sur le texte libre ; 3) IA (Claude ou modèle OpenRouter) pour les textes restants, si activée."),
         ("Rôle de l'IA", "L'IA ne calcule aucun indicateur. Elle classe les textes et rédige l'analyse à partir des chiffres calculés ici. "
                          "Les recommandations doivent être validées par un ingénieur."),
         ("Source", f"{source_name} — période du {a.period_start:%d/%m/%Y} au {a.period_end - pd.Timedelta(days=1):%d/%m/%Y}."),
@@ -360,8 +376,8 @@ def build_report(a: Analysis, insights: dict, source_name: str = "export SAP PM"
         ws.set_row(r + 1, 30)
 
     row = 10
-    src = "Analyse rédigée par l'IA (Claude) à partir des indicateurs calculés" if insights.get("source") == "claude" \
-        else "Analyse automatique (règles) — activez l'IA pour une analyse rédigée"
+    src = f"Analyse rédigée par l'IA ({insights.get('model', 'IA')}) à partir des indicateurs calculés" \
+        if insights.get("source") == "ai" else "Analyse automatique (règles) — activez l'IA pour une analyse rédigée"
     ws.merge_range(row, 1, row, 8, "Résumé", f["h2"])
     ws.merge_range(row + 1, 1, row + 1, 8, src, f["note"])
     ws.merge_range(row + 2, 1, row + 2, 8, insights["executive_summary"], f["body"])
@@ -408,3 +424,89 @@ def _write_rows(ws, frame: pd.DataFrame, cols: list[str], kinds: list[str], f: d
                 ws.write_number(i, c, float(v), f[kind])
             else:
                 ws.write_string(i, c, str(v), f[kind] if kind in f else f["text"])
+
+
+def build_daily_brief(brief: dict, source_name: str = "export SAP PM") -> bytes:
+    """One printable page for the morning operations meeting (« J-1 »)."""
+    buf = io.BytesIO()
+    wb = xlsxwriter.Workbook(buf, {"in_memory": True})
+    base = {"font_name": FONT, "font_size": 10, "valign": "vcenter"}
+
+    def F(**kw):
+        return wb.add_format({**base, **kw})
+
+    cell = dict(border=1, border_color="#E3E8EF")
+    f = {
+        "title": F(font_size=18, bold=True, font_color=NAVY),
+        "sub": F(font_color=GREY),
+        "h2": F(font_size=12, bold=True, font_color=NAVY, bottom=2, bottom_color=BLUE),
+        "header": F(bold=True, font_color="white", bg_color=NAVY, text_wrap=True, **cell),
+        "text": F(text_wrap=True, valign="top", **cell),
+        "num": F(num_format="#,##0.0", valign="top", **cell),
+        "dt": F(num_format="dd/mm hh:mm", valign="top", **cell),
+        "kpi_label": F(font_size=9, font_color=GREY, bg_color=LIGHT, left=4, left_color=BLUE),
+        "kpi": F(font_size=16, bold=True, font_color=NAVY, bg_color=LIGHT, left=4, left_color=BLUE, align="left"),
+        "alert": F(bold=True, font_color="#9B1C1C", bg_color="#FDE2E1", valign="top", **cell),
+        "note": F(font_size=9, italic=True, font_color=GREY),
+    }
+    ws = wb.add_worksheet("Réunion J-1")
+    ws.hide_gridlines(2)
+    ws.set_paper(9)
+    ws.set_landscape()
+    ws.fit_to_pages(1, 0)
+    ws.set_margins(left=0.4, right=0.4, top=0.5, bottom=0.5)
+    for c, w in enumerate([11, 10, 26, 40, 20, 8, 10, 11, 12]):
+        ws.set_column(c, c, w)
+
+    day = brief["day"]
+    ws.write(0, 0, f"Réunion opérationnelle — interventions du {JOURS[day.weekday()]} {day:%d/%m/%Y}", f["title"])
+    ws.write(1, 0, f"Source : {source_name}", f["sub"])
+    tiles = [("Interventions", brief["n_interventions"]), ("Pannes", brief["n_failures"]),
+             ("Arrêts machine", brief["n_stops"]), ("Heures d'arrêt", round(brief["downtime_h"], 1)),
+             ("Urgences", brief["n_emergencies"]), ("Récidives connues", brief["n_recurring"])]
+    for i, (label, value) in enumerate(tiles):
+        ws.write(3, i, label, f["kpi_label"])
+        ws.write(4, i, value, f["kpi"])
+    ws.set_row(4, 26)
+
+    row = 6
+    still = brief["still_down"]
+    ws.merge_range(row, 0, row, 8, f"Équipements toujours à l'arrêt en fin de journée ({len(still)})", f["h2"])
+    row += 1
+    if still.empty:
+        ws.write(row, 0, "Aucun.", f["note"])
+        row += 2
+    else:
+        for c, h in enumerate(["Ordre", "Équipement", "Désignation", "Description", "Début panne", "À l'arrêt depuis (h)"]):
+            ws.write(row, c, h, f["header"])
+        for r in still.itertuples():
+            row += 1
+            ws.write(row, 0, str(r.order_id), f["alert"])
+            ws.write(row, 1, str(r.equipment_id), f["text"])
+            ws.write(row, 2, str(r.equipment_desc), f["text"])
+            ws.write(row, 3, str(_clean(r.description) or ""), f["text"])
+            ws.write_datetime(row, 4, r.malfunction_start.to_pydatetime(), f["dt"])
+            ws.write_number(row, 5, float(r.down_since_h), f["num"])
+        row += 2
+
+    items = brief["interventions"]
+    ws.merge_range(row, 0, row, 8, f"Interventions de la journée ({len(items)})", f["h2"])
+    row += 1
+    for c, h in enumerate(["Ordre", "Nature", "Équipement", "Description", "Mode de défaillance", "Prio", "Arrêt (h)", "Statut", "Récidive"]):
+        ws.write(row, c, h, f["header"])
+    for r in items.itertuples():
+        row += 1
+        ws.write(row, 0, str(r.order_id), f["text"])
+        ws.write(row, 1, ORDER_TYPE_LABELS.get(r.order_kind, ""), f["text"])
+        ws.write(row, 2, str(r.equipment_desc), f["text"])
+        ws.write(row, 3, str(_clean(r.description) or ""), f["text"])
+        ws.write(row, 4, CATEGORIES.get(r.category, "") if isinstance(r.category, str) else "", f["text"])
+        ws.write(row, 5, str(_clean(r.priority) or ""), f["text"])
+        ws.write_number(row, 6, float(r.downtime_h), f["num"])
+        ws.write(row, 7, str(_clean(r.status) or ""), f["text"])
+        ws.write(row, 8, "OUI" if r.recurring else "", f["alert"] if r.recurring else f["text"])
+    row += 2
+    ws.write(row, 0, "« Récidive » : même équipement et même mode de défaillance que des pannes récurrentes "
+                     "détectées sur la période. Généré par SAP PM Analyst.", f["note"])
+    wb.close()
+    return buf.getvalue()
